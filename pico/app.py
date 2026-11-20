@@ -1,4 +1,3 @@
-
 # Remote Wake-on-LAN via a Telegram bot  -  MicroPython
 # Runs on: ESP32 / ESP32-S3 / ESP32-C3 boards, Raspberry Pi Pico 2 W / Pico W
 #
@@ -11,30 +10,30 @@
 #
 # Over-the-air updates: this file runs as app.py, started by main.py + ota.py.
 # Your own settings go in config.py on the board (never on GitHub).
- 
+
 import network, socket, time, machine, ubinascii, json, gc, sys
 try:
     import requests
 except ImportError:
     import urequests as requests
- 
+
 # ---------------- CONFIG ----------------
 WIFI_SSID = ""
 WIFI_PASS = ""
- 
+
 BOT_TOKEN   = ""   # this board's own bot
 DEVICE_NAME = "pico"            # shown on replies, e.g. "esp32" or "pico"
- 
+
 # Telegram user IDs allowed to give commands (works in private chats and groups).
 # Leave empty at first, message the bot, and the board prints your ID in Thonny.
 ALLOWED_USERS = ()               # e.g. (123456789,)  or for two people (111, 222)
- 
+
 # name -> settings. "ip"/"port" are optional; they let the board confirm the PC
 # came up (3389 = Remote Desktop, 445 = Windows file sharing, 22 = SSH).
 TARGETS = {
     "xxx": {"mac": "", "ip": "", "port": 22},
 }
- 
+
 # "auto" = send to BOTH 255.255.255.255 and this network's own broadcast address
 # (e.g. 192.168.1.255, worked out from the board's IP), like routers such as
 # pfSense do. Or set one address, e.g. "192.168.1.255".
@@ -43,45 +42,44 @@ WOL_PORTS   = (9, 7)             # the two standard WoL ports; most PCs ignore t
 BOOT_WAIT_S = 120                # how long to wait for the PC after waking it
 MAX_AGE_S   = 300                # ignore commands older than this (needs the clock, set via NTP)
 LONG_POLL_S = 20                 # Telegram holds each request open up to this long
-NTP_HOST    = ""                 # e.g. your router's IP if it serves time; "" = public servers
- 
+
 # Status LED. "auto" = "LED" on a Pico, GPIO 2 on an ESP32 (the blue LED on most
 # ESP32 DevKit-style boards). Set a GPIO number for other boards, or None for no LED.
 LED_PIN = "auto"
- 
+
 # Over-the-air updates (see the "OTA updates" tab in the guide)
 OTA_URL     = ""                 # e.g. "https://raw.githubusercontent.com/you/wol-firmware/main"
 OTA_CHANNEL = "auto"             # folder in that repo: "auto" = "esp32" or "pico"
 # ----------------------------------------
- 
+
 # Settings in config.py (kept on the board) replace the ones above, so this file
 # can live on GitHub without your Wi-Fi password or bot token.
 try:
     from config import *
 except ImportError:
     pass
- 
+
 try:
     import ota
 except ImportError:
     ota = None
- 
+
 IS_PICO = sys.platform == "rp2"
 API = "https://api.telegram.org/bot" + BOT_TOKEN + "/"
- 
+
 # Accept 123, (123), (123,), [123, 456] or "123" - (123) without a comma is a plain number.
 if isinstance(ALLOWED_USERS, (int, str)):
     ALLOWED_USERS = (ALLOWED_USERS,)
 ALLOWED_USERS = tuple(int(u) for u in ALLOWED_USERS)
 print("Allowed user IDs:", ALLOWED_USERS or "none yet - message the bot to see your ID")
- 
- 
+
+
 def show_error(label, e):
     print(label, e)
     if hasattr(sys, "print_exception"):   # MicroPython: show the line that failed
         sys.print_exception(e)
- 
- 
+
+
 class Led:
     def __init__(self, pin):
         if pin == "auto":
@@ -96,12 +94,12 @@ class Led:
         if self.p: self.p.value(0)
     def toggle(self):
         if self.p: self.p.value(0 if self.p.value() else 1)
- 
- 
+
+
 led = Led(LED_PIN)
 wlan = network.WLAN(network.STA_IF)
- 
- 
+
+
 # ---------- Wi-Fi + clock ----------
 def connect_wifi():
     wlan.active(True)
@@ -122,50 +120,35 @@ def connect_wifi():
         machine.reset()
     led.on()
     print("Wi-Fi connected, IP", wlan.ifconfig()[0])
- 
- 
+
+
 # Some ports count time from 2000 instead of 1970; Telegram uses 1970.
 EPOCH_OFFSET = 946684800 if time.gmtime(0)[0] == 2000 else 0
 clock_ok = False
- 
- 
+
+
 def sync_clock():
-    """Set the clock over NTP. Tries NTP_HOST first, then public servers."""
-    global clock_ok, last_ntp_try
-    last_ntp_try = time.ticks_ms()
+    global clock_ok
     try:
         import ntptime
-    except ImportError:
-        return
-    hosts = [h for h in (NTP_HOST, "pool.ntp.org", "time.google.com", "time.cloudflare.com") if h]
-    for host in hosts:
-        try:
-            ntptime.host = host
-            ntptime.timeout = 3
-            ntptime.settime()
-            clock_ok = True
-            print("Clock set from", host)
-            return
-        except Exception as e:
-            print("NTP via %s failed: %s" % (host, e))
-    print("NTP failed everywhere (old commands won't be filtered by age); will retry hourly")
- 
- 
-last_ntp_try = 0
- 
- 
+        ntptime.settime()
+        clock_ok = True
+    except Exception as e:
+        print("NTP failed (old commands won't be filtered by age):", e)
+
+
 def now_unix():
     return time.time() + EPOCH_OFFSET
- 
- 
+
+
 # ---------- Wake-on-LAN ----------
 def magic_packet(mac):
     mac_bytes = ubinascii.unhexlify(mac.replace(":", "").replace("-", ""))
     if len(mac_bytes) != 6:
         raise ValueError("bad MAC: " + mac)
     return b"\xff" * 6 + mac_bytes * 16
- 
- 
+
+
 def broadcast_addrs():
     if BROADCAST != "auto":
         return [BROADCAST]
@@ -176,8 +159,8 @@ def broadcast_addrs():
     if subnet_bcast not in out:
         out.append(subnet_bcast)
     return out
- 
- 
+
+
 def send_wol(mac):
     """Send the magic packet; returns the addresses it went out to."""
     pkt = magic_packet(mac)
@@ -209,8 +192,8 @@ def send_wol(mac):
     for _ in range(3):              # blink to confirm
         led.off(); time.sleep_ms(100); led.on(); time.sleep_ms(100)
     return sent
- 
- 
+
+
 def is_up(t):
     """True/False if the target answers on its TCP port, None if no check set."""
     if not t.get("ip"):
@@ -224,12 +207,12 @@ def is_up(t):
         return False
     finally:
         s.close()
- 
- 
+
+
 # ---------- Telegram ----------
 long_poll_ok = True     # turned off if this MicroPython's requests lacks timeout=
- 
- 
+
+
 def tg(method, payload, wait=0):
     global long_poll_ok
     gc.collect()                    # TLS needs a big chunk of RAM on a plain ESP32
@@ -247,40 +230,40 @@ def tg(method, payload, wait=0):
         return r.json()
     finally:
         r.close()
- 
- 
+
+
 def reply(chat, text):
     print(text)
     try:
         tg("sendMessage", {"chat_id": chat, "text": "[%s] %s" % (DEVICE_NAME, text)})
     except Exception as e:
         print("send failed:", e)
- 
- 
+
+
 def describe(up):
     return {True: "ON", False: "off / not responding", None: "unknown (no IP set)"}[up]
- 
- 
+
+
 def handle(chat, text):
     parts = text.strip().split()
     cmd = parts[0].lower().split("@")[0]        # handles "/wake@MyBot"
     arg = parts[1].lower() if len(parts) > 1 else None
- 
+
     if cmd in ("/start", "/help"):
         reply(chat, "Commands:\n/wake [name]\n/status\n/list\n/version\n/update\n/rollback\n\nTargets: " + ", ".join(TARGETS))
- 
+
     elif cmd == "/list":
         reply(chat, "\n".join("%s  %s" % (n, t["mac"]) for n, t in TARGETS.items()))
- 
+
     elif cmd == "/status":
         lines = ["%s: %s" % (n, describe(is_up(t))) for n, t in TARGETS.items()]
         lines.append("Board up %d min, IP %s" % (time.ticks_ms() // 60000, wlan.ifconfig()[0]))
         reply(chat, "\n".join(lines))
- 
+
     elif cmd == "/version":
         v = ota.version() if ota else 0
         reply(chat, "Firmware v%d%s" % (v, "" if OTA_URL else " (OTA_URL isn't set)"))
- 
+
     elif cmd in ("/update", "/rollback"):
         if ota is None:
             reply(chat, "ota.py isn't on this board, so it can't update itself.")
@@ -296,7 +279,7 @@ def handle(chat, text):
             reply(chat, "Going back to the previous firmware. Restarting...")
         time.sleep(1)
         machine.reset()
- 
+
     elif cmd == "/wake":
         if arg is None and len(TARGETS) == 1:
             arg = next(iter(TARGETS))
@@ -321,8 +304,8 @@ def handle(chat, text):
         reply(chat, "%s didn't respond within %d s. It may still be booting, or WoL "
                     "may be off. Try /status in a minute." % (arg, BOOT_WAIT_S))
     # anything else (ordinary chat in a group) is ignored silently
- 
- 
+
+
 def ota_report():
     """Telegram works: confirm a trial update and report any update result."""
     if ota is None:
@@ -338,13 +321,13 @@ def ota_report():
             reply(chat, msg)
         else:
             print(msg)
- 
- 
+
+
 # ---------- main loop ----------
 def main():
     connect_wifi()
     sync_clock()
- 
+
     # Skip any messages sent while the board was off, so an old /wake
     # doesn't fire unexpectedly after a power cut.
     offset = None
@@ -359,14 +342,12 @@ def main():
             time.sleep(10)
     print("[%s] Listening for Telegram commands..." % DEVICE_NAME)
     ota_report()
- 
+
     fails = 0
     while True:
         try:
             if not wlan.isconnected():
                 connect_wifi()
-            if not clock_ok and time.ticks_diff(time.ticks_ms(), last_ntp_try) > 3600000:
-                sync_clock()
             res = tg("getUpdates", {"offset": offset, "timeout": LONG_POLL_S,
                                     "allowed_updates": ["message"]}, wait=LONG_POLL_S)
             if not res.get("ok"):
@@ -395,7 +376,6 @@ def main():
             if fails >= 10:                          # e.g. internet down for a while
                 machine.reset()
             time.sleep(min(60, 5 * fails))
- 
- 
+
+
 main()
- 
