@@ -7,6 +7,7 @@
 #
 # Give EACH board its own bot (two boards can't share one bot's messages).
 # Commands:  /wake [name]   /status   /list   /help   /version   /update   /rollback
+#            /add name MAC [ip] [port]   /remove name   (PC list changes, saved on the board)
 #
 # Over-the-air updates: this file runs as app.py, started by main.py + ota.py.
 # Your own settings go in config.py on the board (never on GitHub).
@@ -42,6 +43,7 @@ WOL_PORTS   = (9, 7)             # the two standard WoL ports; most PCs ignore t
 BOOT_WAIT_S = 120                # how long to wait for the PC after waking it
 MAX_AGE_S   = 300                # ignore commands older than this (needs the clock, set via NTP)
 LONG_POLL_S = 20                 # Telegram holds each request open up to this long
+NTP_HOST    = ""                 # e.g. your router's IP if it serves time; "" = public servers
 
 # Status LED. "auto" = "LED" on a Pico, GPIO 2 on an ESP32 (the blue LED on most
 # ESP32 DevKit-style boards). Set a GPIO number for other boards, or None for no LED.
@@ -128,13 +130,28 @@ clock_ok = False
 
 
 def sync_clock():
-    global clock_ok
+    """Set the clock over NTP. Tries NTP_HOST first, then public servers."""
+    global clock_ok, last_ntp_try
+    last_ntp_try = time.ticks_ms()
     try:
         import ntptime
-        ntptime.settime()
-        clock_ok = True
-    except Exception as e:
-        print("NTP failed (old commands won't be filtered by age):", e)
+    except ImportError:
+        return
+    hosts = [h for h in (NTP_HOST, "pool.ntp.org", "time.google.com", "time.cloudflare.com") if h]
+    for host in hosts:
+        try:
+            ntptime.host = host
+            ntptime.timeout = 3
+            ntptime.settime()
+            clock_ok = True
+            print("Clock set from", host)
+            return
+        except Exception as e:
+            print("NTP via %s failed: %s" % (host, e))
+    print("NTP failed everywhere (old commands won't be filtered by age); will retry hourly")
+
+
+last_ntp_try = 0
 
 
 def now_unix():
@@ -240,6 +257,90 @@ def reply(chat, text):
         print("send failed:", e)
 
 
+# ---------- PC list, editable from Telegram ----------
+# /add and /remove save the list to targets.json on the board. Once that file exists it
+# replaces TARGETS from config.py / this file, and it survives restarts and updates.
+TARGETS_FILE = "targets.json"
+
+
+def load_targets():
+    global TARGETS
+    try:
+        with open(TARGETS_FILE) as f:
+            TARGETS = json.load(f)
+        print("PC list from %s: %s" % (TARGETS_FILE, ", ".join(TARGETS) or "(empty)"))
+    except (OSError, ValueError):
+        pass
+
+
+def save_targets():
+    with open(TARGETS_FILE + ".tmp", "w") as f:
+        json.dump(TARGETS, f)
+    try:
+        import os
+        try:
+            os.remove(TARGETS_FILE)
+        except OSError:
+            pass
+        os.rename(TARGETS_FILE + ".tmp", TARGETS_FILE)
+    except OSError as e:
+        print("couldn't save PC list:", e)
+
+
+def clean_mac(mac):
+    hexs = mac.replace(":", "").replace("-", "").replace(".", "").upper()
+    if len(hexs) != 12 or any(c not in "0123456789ABCDEF" for c in hexs):
+        return None
+    return ":".join(hexs[i:i + 2] for i in range(0, 12, 2))
+
+
+def valid_ip(ip):
+    p = ip.split(".")
+    return len(p) == 4 and all(x.isdigit() and 0 <= int(x) <= 255 for x in p)
+
+
+def add_target(chat, parts):
+    usage = ("Usage: /add name MAC [ip] [port]\n"
+             "e.g. /add desktop AA:BB:CC:DD:EE:FF 192.168.1.50 3389\n"
+             "The IP and port are optional; they let me check the PC came up.")
+    if len(parts) < 3:
+        reply(chat, usage)
+        return
+    name, mac = parts[1].lower(), clean_mac(parts[2])
+    if not mac:
+        reply(chat, "That MAC doesn't look right: %s\n%s" % (parts[2], usage))
+        return
+    if name.startswith("/") or len(name) > 20:
+        reply(chat, "Pick a short name without a slash.")
+        return
+    t = {"mac": mac}
+    if len(parts) > 3:
+        if not valid_ip(parts[3]):
+            reply(chat, "That IP doesn't look right: %s" % parts[3])
+            return
+        t["ip"] = parts[3]
+        port = parts[4] if len(parts) > 4 else "3389"
+        if not port.isdigit() or not 0 < int(port) < 65536:
+            reply(chat, "The port should be a number like 3389, 445 or 22.")
+            return
+        t["port"] = int(port)
+    existed = name in TARGETS
+    TARGETS[name] = t
+    save_targets()
+    where = " (%s port %d)" % (t["ip"], t["port"]) if "ip" in t else ""
+    reply(chat, "%s %s: %s%s.\nPCs: %s" % ("Updated" if existed else "Added", name, mac, where,
+                                          ", ".join(TARGETS)))
+
+
+def remove_target(chat, name):
+    if name not in TARGETS:
+        reply(chat, "No PC called %s. PCs: %s" % (name, ", ".join(TARGETS) or "none"))
+        return
+    del TARGETS[name]
+    save_targets()
+    reply(chat, "Removed %s. PCs: %s" % (name, ", ".join(TARGETS) or "none - use /add"))
+
+
 def describe(up):
     return {True: "ON", False: "off / not responding", None: "unknown (no IP set)"}[up]
 
@@ -250,10 +351,22 @@ def handle(chat, text):
     arg = parts[1].lower() if len(parts) > 1 else None
 
     if cmd in ("/start", "/help"):
-        reply(chat, "Commands:\n/wake [name]\n/status\n/list\n/version\n/update\n/rollback\n\nTargets: " + ", ".join(TARGETS))
+        reply(chat, "Commands:\n/wake [name]\n/status\n/list\n/add name MAC [ip] [port]\n/remove name\n"
+                    "/version\n/update\n/rollback\n\nTargets: " + (", ".join(TARGETS) or "none yet"))
 
     elif cmd == "/list":
-        reply(chat, "\n".join("%s  %s" % (n, t["mac"]) for n, t in TARGETS.items()))
+        reply(chat, "\n".join("%s  %s%s" % (n, t["mac"], "  %s:%s" % (t["ip"], t.get("port", 3389))
+                                                   if t.get("ip") else "")
+                              for n, t in TARGETS.items()) or "No PCs yet. Use /add name MAC [ip] [port]")
+
+    elif cmd == "/add":
+        add_target(chat, text.strip().split())
+
+    elif cmd == "/remove":
+        if arg is None:
+            reply(chat, "Usage: /remove name")
+        else:
+            remove_target(chat, arg)
 
     elif cmd == "/status":
         lines = ["%s: %s" % (n, describe(is_up(t))) for n, t in TARGETS.items()]
@@ -325,6 +438,7 @@ def ota_report():
 
 # ---------- main loop ----------
 def main():
+    load_targets()
     connect_wifi()
     sync_clock()
 
@@ -348,6 +462,8 @@ def main():
         try:
             if not wlan.isconnected():
                 connect_wifi()
+            if not clock_ok and time.ticks_diff(time.ticks_ms(), last_ntp_try) > 3600000:
+                sync_clock()
             res = tg("getUpdates", {"offset": offset, "timeout": LONG_POLL_S,
                                     "allowed_updates": ["message"]}, wait=LONG_POLL_S)
             if not res.get("ok"):
